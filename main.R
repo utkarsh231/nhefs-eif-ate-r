@@ -1,11 +1,21 @@
-# install.packages(c("tidyverse", "sandwich", "lmtest", "crossfit", "ggplot2"))
+# install.packages(c("tidyverse", "sandwich", "lmtest", "crossfit", "ggplot2", "ranger"))
 
 library(tidyverse)
 library(crossfit)
 library(ggplot2)
 
+if (!requireNamespace("ranger", quietly = TRUE)) {
+  stop("Please install the 'ranger' package: install.packages('ranger')", call. = FALSE)
+}
+
 # 1) Load the What If / NHEFS data
-nhefs <- read_csv("data/nhefs.csv", show_col_types = FALSE)
+data_path <- if (file.exists("Data/nhefs.csv")) {
+  "Data/nhefs.csv"
+} else {
+  "data/nhefs.csv"
+}
+
+nhefs <- read_csv(data_path, show_col_types = FALSE)
 
 # 2) Quick look
 #glimpse(nhefs)
@@ -156,35 +166,132 @@ method_cf_aipw <- create_method(
   aggregate_repeats = mean_estimate
 )
 
+set.seed(20260429)
 cf_res <- crossfit(dat, method_cf_aipw)
 cf_aipw_ate <- cf_res$estimates[[1]]
 
+# 9) Cross-fitted AIPW with random forest nuisance models
+rf_dat <- dat %>%
+  select(
+    wt82_71, qsmk, sex, race, age, education,
+    smokeintensity, smokeyrs, exercise, active, wt71
+  ) %>%
+  mutate(
+    qsmk_num = qsmk,
+    qsmk = factor(qsmk, levels = c(0, 1), labels = c("No quit", "Quit")),
+    sex = factor(sex),
+    race = factor(race),
+    education = factor(education),
+    exercise = factor(exercise),
+    active = factor(active)
+  )
+
+rf_covariates <- c(
+  "sex", "race", "age", "education", "smokeintensity",
+  "smokeyrs", "exercise", "active", "wt71"
+)
+
+rf_ps_formula <- as.formula(paste("qsmk ~", paste(rf_covariates, collapse = " + ")))
+rf_outcome_formula <- as.formula(
+  paste("wt82_71 ~ qsmk +", paste(rf_covariates, collapse = " + "))
+)
+
+clip_ps <- function(ps, lower = 0.01, upper = 0.99) {
+  pmin(pmax(ps, lower), upper)
+}
+
+fit_rf_nuisance <- function(train_data, seed) {
+  ps_fit <- ranger::ranger(
+    formula = rf_ps_formula,
+    data = train_data,
+    probability = TRUE,
+    num.trees = 500,
+    mtry = 4,
+    min.node.size = 5,
+    importance = "permutation",
+    seed = seed
+  )
+
+  outcome_fit <- ranger::ranger(
+    formula = rf_outcome_formula,
+    data = train_data,
+    num.trees = 500,
+    mtry = 4,
+    min.node.size = 5,
+    importance = "permutation",
+    seed = seed + 1
+  )
+
+  list(ps = ps_fit, outcome = outcome_fit)
+}
+
+predict_rf_nuisance <- function(fits, new_data) {
+  ps_hat <- predict(fits$ps, data = new_data)$predictions[, "Quit"]
+
+  data1 <- new_data
+  data0 <- new_data
+  data1$qsmk <- factor("Quit", levels = levels(rf_dat$qsmk))
+  data0$qsmk <- factor("No quit", levels = levels(rf_dat$qsmk))
+
+  tibble(
+    ps_hat = clip_ps(as.numeric(ps_hat)),
+    mu1_hat = as.numeric(predict(fits$outcome, data = data1)$predictions),
+    mu0_hat = as.numeric(predict(fits$outcome, data = data0)$predictions)
+  )
+}
+
+estimate_rf_aipw <- function(data, nuisances) {
+  phi <- with(
+    bind_cols(data, nuisances),
+    qsmk_num / ps_hat * (wt82_71 - mu1_hat) -
+      (1 - qsmk_num) / (1 - ps_hat) * (wt82_71 - mu0_hat) +
+      mu1_hat - mu0_hat
+  )
+
+  ate <- mean(phi)
+  se <- sd(phi) / sqrt(nrow(data))
+
+  tibble(
+    estimate = ate,
+    std_error = se,
+    ci_lower = ate - 1.96 * se,
+    ci_upper = ate + 1.96 * se
+  )
+}
+
+set.seed(20260429)
+rf_n_folds <- 5
+rf_fold_id <- sample(rep(seq_len(rf_n_folds), length.out = nrow(rf_dat)))
+rf_cf_nuisances <- tibble(
+  ps_hat = rep(NA_real_, nrow(rf_dat)),
+  mu1_hat = rep(NA_real_, nrow(rf_dat)),
+  mu0_hat = rep(NA_real_, nrow(rf_dat))
+)
+
+for (fold in seq_len(rf_n_folds)) {
+  rf_train <- rf_dat[rf_fold_id != fold, ]
+  rf_holdout <- rf_dat[rf_fold_id == fold, ]
+  rf_fits <- fit_rf_nuisance(rf_train, seed = 20260429 + fold * 10)
+  rf_cf_nuisances[rf_fold_id == fold, ] <- predict_rf_nuisance(rf_fits, rf_holdout)
+}
+
+rf_aipw_res <- estimate_rf_aipw(rf_dat, rf_cf_nuisances)
+rf_cf_aipw_ate <- rf_aipw_res$estimate
+
 results_tbl <- tibble(
-  method = c("Naive", "G-computation", "AIPW", "Cross-fitted AIPW"),
-  estimate = c(naive_ate, gcomp_ate, aipw_ate, cf_aipw_ate),
-  std_error = c(NA_real_, NA_real_, aipw_se, NA_real_),
-  ci_lower = c(NA_real_, NA_real_, aipw_ci[1], NA_real_),
-  ci_upper = c(NA_real_, NA_real_, aipw_ci[2], NA_real_)
+  method = c(
+    "Naive",
+    "G-computation",
+    "AIPW",
+    "Cross-fitted AIPW",
+    "Cross-fitted RF AIPW"
+  ),
+  estimate = c(naive_ate, gcomp_ate, aipw_ate, cf_aipw_ate, rf_cf_aipw_ate),
+  std_error = c(NA_real_, NA_real_, aipw_se, NA_real_, rf_aipw_res$std_error),
+  ci_lower = c(NA_real_, NA_real_, aipw_ci[1], NA_real_, rf_aipw_res$ci_lower),
+  ci_upper = c(NA_real_, NA_real_, aipw_ci[2], NA_real_, rf_aipw_res$ci_upper)
 )
 
 print(results_tbl)
-
-ps_overlap_plot <- ggplot(dat, aes(x = ps, fill = factor(qsmk))) +
-  geom_density(alpha = 0.4) +
-  labs(
-    title = "Propensity Score Overlap by Treatment Group",
-    x = "Estimated propensity score",
-    y = "Density",
-    fill = "qsmk"
-  )
-
 print(nrow(dat))
 
-print(ps_overlap_plot)
-
-print(naive_ate)
-print(gcomp_ate)
-print(aipw_ate)
-print(aipw_se)
-print(aipw_ci)
-print(cf_aipw_ate)
