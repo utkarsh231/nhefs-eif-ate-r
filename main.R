@@ -48,6 +48,20 @@ dat %>%
 naive_ate <- with(dat, mean(wt82_71[qsmk == 1]) - mean(wt82_71[qsmk == 0]))
 naive_ate
 
+naive_res <- with(
+  dat,
+  tibble(
+    estimate = naive_ate,
+    variance = var(wt82_71[qsmk == 1]) / sum(qsmk == 1) +
+      var(wt82_71[qsmk == 0]) / sum(qsmk == 0)
+  )
+) %>%
+  mutate(
+    std_error = sqrt(variance),
+    ci_lower = estimate - 1.96 * std_error,
+    ci_upper = estimate + 1.96 * std_error
+  )
+
 # 5) Outcome regression (g-computation style)
 outcome_model <- lm(
   wt82_71 ~ qsmk + sex + race + age + I(age^2) + education +
@@ -64,6 +78,14 @@ mu0_hat <- predict(outcome_model, newdata = dat0)
 
 gcomp_ate <- mean(mu1_hat - mu0_hat)
 gcomp_ate
+gcomp_se <- summary(outcome_model)$coefficients["qsmk", "Std. Error"]
+gcomp_res <- tibble(
+  estimate = gcomp_ate,
+  variance = gcomp_se^2,
+  std_error = gcomp_se,
+  ci_lower = gcomp_ate - 1.96 * gcomp_se,
+  ci_upper = gcomp_ate + 1.96 * gcomp_se
+)
 
 # 6) Propensity score model
 ps_model <- glm(
@@ -91,6 +113,7 @@ dat$phi <- with(dat,
 
 aipw_ate <- mean(dat$phi)
 aipw_se  <- sd(dat$phi) / sqrt(nrow(dat))
+aipw_var <- aipw_se^2
 aipw_ci  <- c(aipw_ate - 1.96 * aipw_se, aipw_ate + 1.96 * aipw_se)
 
 # 8) Cross-fitted AIPW using the crossfit package
@@ -169,6 +192,71 @@ method_cf_aipw <- create_method(
 set.seed(20260429)
 cf_res <- crossfit(dat, method_cf_aipw)
 cf_aipw_ate <- cf_res$estimates[[1]]
+
+estimate_glm_cf_aipw <- function(data, n_folds = 5, seed = 20260429) {
+  set.seed(seed)
+  fold_id <- sample(rep(seq_len(n_folds), length.out = nrow(data)))
+  nuisances <- tibble(
+    ps_hat = rep(NA_real_, nrow(data)),
+    mu1_hat = rep(NA_real_, nrow(data)),
+    mu0_hat = rep(NA_real_, nrow(data))
+  )
+
+  for (fold in seq_len(n_folds)) {
+    train <- data[fold_id != fold, ]
+    holdout <- data[fold_id == fold, ]
+
+    ps_fit <- glm(
+      qsmk ~ sex + race + age + I(age^2) + education +
+        smokeintensity + I(smokeintensity^2) + smokeyrs + I(smokeyrs^2) +
+        exercise + active + wt71 + I(wt71^2),
+      family = binomial(),
+      data = train
+    )
+
+    outcome_fit <- lm(
+      wt82_71 ~ qsmk + sex + race + age + I(age^2) + education +
+        smokeintensity + I(smokeintensity^2) + smokeyrs + I(smokeyrs^2) +
+        exercise + active + wt71 + I(wt71^2),
+      data = train
+    )
+
+    holdout1 <- holdout
+    holdout0 <- holdout
+    holdout1$qsmk <- 1
+    holdout0$qsmk <- 0
+
+    nuisances[fold_id == fold, ] <- tibble(
+      ps_hat = pmin(
+        pmax(as.numeric(predict(ps_fit, newdata = holdout, type = "response")), 0.01),
+        0.99
+      ),
+      mu1_hat = as.numeric(predict(outcome_fit, newdata = holdout1)),
+      mu0_hat = as.numeric(predict(outcome_fit, newdata = holdout0))
+    )
+  }
+
+  phi <- with(
+    bind_cols(data, nuisances),
+    qsmk / ps_hat * (wt82_71 - mu1_hat) -
+      (1 - qsmk) / (1 - ps_hat) * (wt82_71 - mu0_hat) +
+      mu1_hat - mu0_hat
+  )
+
+  ate <- mean(phi)
+  se <- sd(phi) / sqrt(nrow(data))
+
+  tibble(
+    estimate = ate,
+    variance = se^2,
+    std_error = se,
+    ci_lower = ate - 1.96 * se,
+    ci_upper = ate + 1.96 * se
+  )
+}
+
+cf_aipw_res <- estimate_glm_cf_aipw(dat)
+cf_aipw_ate <- cf_aipw_res$estimate
 
 # 9) Cross-fitted AIPW with random forest nuisance models
 rf_dat <- dat %>%
@@ -253,6 +341,7 @@ estimate_rf_aipw <- function(data, nuisances) {
 
   tibble(
     estimate = ate,
+    variance = se^2,
     std_error = se,
     ci_lower = ate - 1.96 * se,
     ci_upper = ate + 1.96 * se
@@ -287,11 +376,35 @@ results_tbl <- tibble(
     "Cross-fitted RF AIPW"
   ),
   estimate = c(naive_ate, gcomp_ate, aipw_ate, cf_aipw_ate, rf_cf_aipw_ate),
-  std_error = c(NA_real_, NA_real_, aipw_se, NA_real_, rf_aipw_res$std_error),
-  ci_lower = c(NA_real_, NA_real_, aipw_ci[1], NA_real_, rf_aipw_res$ci_lower),
-  ci_upper = c(NA_real_, NA_real_, aipw_ci[2], NA_real_, rf_aipw_res$ci_upper)
+  variance = c(
+    naive_res$variance,
+    gcomp_res$variance,
+    aipw_var,
+    cf_aipw_res$variance,
+    rf_aipw_res$variance
+  ),
+  std_error = c(
+    naive_res$std_error,
+    gcomp_res$std_error,
+    aipw_se,
+    cf_aipw_res$std_error,
+    rf_aipw_res$std_error
+  ),
+  ci_lower = c(
+    naive_res$ci_lower,
+    gcomp_res$ci_lower,
+    aipw_ci[1],
+    cf_aipw_res$ci_lower,
+    rf_aipw_res$ci_lower
+  ),
+  ci_upper = c(
+    naive_res$ci_upper,
+    gcomp_res$ci_upper,
+    aipw_ci[2],
+    cf_aipw_res$ci_upper,
+    rf_aipw_res$ci_upper
+  )
 )
 
 print(results_tbl)
 print(nrow(dat))
-
